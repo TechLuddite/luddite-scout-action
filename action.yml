@@ -1,0 +1,46 @@
+name: Luddite Scout
+description: Static pre-flight checks on a checked-out repository. Runs nothing from it. Works on GitHub Actions and Gitea Actions.
+author: TechLuddite
+branding:
+  icon: shield
+  color: gray-dark
+
+inputs:
+  path:
+    description: Directory to scan, normally the fresh checkout.
+    default: .
+  fail-on:
+    description: Fail the step on a finding at or above this severity (info, low, medium, high), or never.
+    default: high
+  fail-on-incomplete:
+    description: Fail the step when a check was skipped or only partly covered (true or false). Ignored when fail-on is never.
+    default: "true"
+  name:
+    description: Repository name shown in the report, for example owner/repo.
+    default: ""
+  commit:
+    description: Full 40-character commit SHA shown in the report.
+    default: ""
+
+outputs:
+  report:
+    description: Path to the JSON report.
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FAIL_ON_INCOMPLETE: ${{ inputs.fail-on-incomplete }}
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_COMMIT: ${{ inputs.commit }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        report=$(mktemp "${RUNNER_TEMP:-/tmp}/luddite-scout-XXXXXXXX.json")
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        SCOUT_REPORT="$report" python3 -I -S -X utf8 "$ACTION_DIR/gate.py"

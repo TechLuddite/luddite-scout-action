@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ./check-vendor.sh --upstream
+      - run: python3 -m unittest discover -s test
+
+  # Runs the action from this checkout. That is right for this repository's
+  # own CI. Anywhere else, pin the action to a commit SHA.
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan this repository
+        uses: ./
+        with:
+          name: ${{ github.repository }}
+          commit: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Scan a fixture that must fail
+        id: unsafe
+        continue-on-error: true
+        uses: ./
+        with:
+          path: test/fixtures/unsafe
+          name: fixture/unsafe
+      - name: Expect the fixture to fail the gate
+        env:
+          OUTCOME: ${{ steps.unsafe.outcome }}
+        run: test "$OUTCOME" = failure
