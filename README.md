@@ -48,10 +48,42 @@ Use `on: pull_request`, not `pull_request_target`. The action needs no token and
 | `path` | `.` | Directory to scan |
 | `fail-on` | `high` | Fail on a finding at or above `info`, `low`, `medium` or `high`, or `never` |
 | `fail-on-incomplete` | `true` | Fail when a check was skipped or only partly covered, for example a file over a read limit. Ignored when `fail-on` is `never` |
+| `accepted` | none | Path, inside the scanned directory, of a JSON file of accepted findings. See below |
 | `name` | directory name | Repository name for the report |
 | `commit` | none | Full commit SHA for the report |
 
 The output `report` is the path to the JSON report. The readable report goes to the job log, with workflow commands turned off while it prints, and to the job summary where the runner supports one.
+
+## Accepted findings
+
+Some findings are inherent to what a repository does. A plugin whose purpose is a root helper will always match "Uses sudo or pkexec". To keep the gate green without lowering `fail-on` for everything else, list those findings in a file in the repository and name it in the `accepted` input:
+
+```yaml
+      - uses: TechLuddite/luddite-scout-action@<full commit SHA>
+        with:
+          accepted: .scout-accepted.json
+```
+
+```json
+{
+  "accepted": [
+    {
+      "rule": "S7.sudo",
+      "path": "tools/install-system.py",
+      "reason": "The installer places a root helper. Privilege is the documented purpose."
+    }
+  ]
+}
+```
+
+- `rule` is the finding's rule ID, as shown in the JSON report. `path` is the file the finding names. Leave `path` out only for a finding that has no path. `reason` is required.
+- An entry covers every finding with that rule in that file, and nothing else. The same rule in a new file fails the gate.
+- An accepted finding stays in the report and in the JSON output. The log and the job summary list it again with its reason.
+- An entry that matches no finding fails the gate, so remove an entry when the code it excused is gone.
+- A skipped or partly covered check still fails under `fail-on-incomplete`.
+- The file is read as data: at most 64 KiB and 200 entries, a regular file inside the scanned directory with no symlink in its path, and no keys other than these three. Anything else is a usage error, exit 2.
+
+Only this action reads the file. `bin/scout` and the Luddite Scout website ignore it, so somebody scanning your repository sees every finding. On a pull request the file comes from the pull request head, so a change to it is part of the diff under review. Read that change as closely as a change to the workflow itself.
 
 ## What it checks
 

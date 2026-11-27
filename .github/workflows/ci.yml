@@ -44,3 +44,9 @@ jobs:
         env:
           OUTCOME: ${{ steps.unsafe.outcome }}
         run: test "$OUTCOME" = failure
+      - name: Scan a fixture whose one finding is accepted
+        uses: ./
+        with:
+          path: test/fixtures/accepted
+          name: fixture/accepted
+          accepted: .scout-accepted.json

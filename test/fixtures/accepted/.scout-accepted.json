@@ -1,0 +1,9 @@
+{
+  "accepted": [
+    {
+      "rule": "S4.untrusted-input-in-script",
+      "path": ".gitea/workflows/ci.yml",
+      "reason": "Fixture for the action's own CI. The finding is real and this entry is what the test accepts."
+    }
+  ]
+}
