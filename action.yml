@@ -15,6 +15,9 @@ inputs:
   fail-on-incomplete:
     description: Fail the step when a check was skipped or only partly covered (true or false). Ignored when fail-on is never.
     default: "true"
+  accepted:
+    description: Path, inside the scanned directory, of a JSON file listing accepted findings. Each entry has a rule, a path and a reason. Accepted findings stay in the report and do not fail the step. An entry that matches no finding fails the step. Empty means no file is read.
+    default: ""
   name:
     description: Repository name shown in the report, for example owner/repo.
     default: ""
@@ -36,6 +39,7 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
         INPUT_FAIL_ON_INCOMPLETE: ${{ inputs.fail-on-incomplete }}
+        INPUT_ACCEPTED: ${{ inputs.accepted }}
         INPUT_NAME: ${{ inputs.name }}
         INPUT_COMMIT: ${{ inputs.commit }}
         ACTION_DIR: ${{ github.action_path }}
