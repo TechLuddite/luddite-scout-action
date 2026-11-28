@@ -87,7 +87,7 @@ Only this action reads the file. `bin/scout` and the Luddite Scout website ignor
 
 ## What it checks
 
-The same checks as Luddite Scout, through `bin/scout --dir`: agent instruction files (S2), hidden Unicode (S3), GitHub, Gitea and Forgejo workflows and composite actions (S4), lockfiles against OSV (S5), build-time code (S6) and Omarchy plugin rules (S7). Repository settings (S1) need the GitHub API and are not checked. S5 sends package names and versions from lockfiles to `api.osv.dev`. Nothing else leaves the runner.
+The same checks as Luddite Scout, through `bin/scout --dir`: agent instruction files (S2), hidden Unicode (S3), GitHub, Gitea and Forgejo workflows and composite actions (S4), lockfiles against OSV (S5), build-time code (S6), Omarchy plugin rules (S7), agent traps (S8) and telemetry (S9). Under each hidden Unicode finding in a file, the log lists up to ten of the characters with line, code point and column, and the surrounding text with every character outside printable ASCII written as a code point. Repository settings (S1) need the GitHub API and are not checked. S5 sends package names and versions from lockfiles to `api.osv.dev`. Nothing else leaves the runner.
 
 Findings are pattern matches for a person to judge. A clean report is not proof that a repository is safe.
 
