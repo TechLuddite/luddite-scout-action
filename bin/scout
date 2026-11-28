@@ -7,7 +7,9 @@ Reviews a public GitHub repository with the same checks as the web page
     scout owner/repo            human-readable report
     scout --json owner/repo     JSON report, used by the Omarchy panel
     scout --agent owner/repo    JSON summary for a coding agent: rule IDs and
-                                counts only, no text from the repository
+                                counts only, no text from the repository;
+                                --agent --dir PATH does the same for a local
+                                checkout
     scout --token-stdin ...     read a GitHub token from stdin, never argv
     scout --gh-token ...        use the token of the signed-in GitHub CLI (gh)
     scout --dir PATH            scan a local checkout instead, with the same
@@ -20,8 +22,10 @@ Reviews a public GitHub repository with the same checks as the web page
     scout --plugin ID           scan the installed copy of one of them
     scout --plugin ID --compare scan the installed copy and its source, and
                                 report how the two differ
+    scout --aur NAME            read the AUR build recipe of a package and
+                                report what it downloads and runs
 
-It runs nothing from the scanned repository. It only talks to four fixed
+It runs nothing from the scanned repository. It only talks to five fixed
 HTTPS hosts, refuses redirects, caps every response while reading it, and
 stops at an overall deadline.
 """
@@ -36,13 +40,14 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.5.0"
-ALLOWED_HOSTS = {"api.github.com", "raw.githubusercontent.com", "api.osv.dev", "api.securityscorecards.dev"}
+VERSION = "0.6.0"
+ALLOWED_HOSTS = {"api.github.com", "raw.githubusercontent.com", "api.osv.dev", "api.securityscorecards.dev", "aur.archlinux.org"}
 DEADLINE_SECONDS = 180
 API_MAX_BYTES = 8_000_000
 RAW_MAX_BYTES = 1_000_000
@@ -308,6 +313,138 @@ def _emoji_join(text, i):
     return any(_pictographic(c) for c in text[max(0, i - 2):i]) and any(_pictographic(c) for c in text[i + 1:i + 3])
 
 
+# The same characters as HIDDEN, as ranges, so --agent can hold a fixed list
+# of every code point and Unicode name it may print. A test checks the two agree.
+HIDDEN_RANGES = [(0x00AD, 0x00AD), (0x061C, 0x061C), (0x180E, 0x180E), (0x200B, 0x200F), (0x202A, 0x202E),
+                 (0x2060, 0x2064), (0x2066, 0x2069), (0xFEFF, 0xFEFF), (0xE0000, 0xE007F), (0xE0100, 0xE01EF)]
+HIDDEN_KINDS = ["Bidirectional control", "Tag character", "Variation selector supplement", "Direction mark",
+                "Zero-width joiner", "Soft hyphen", "Zero-width or invisible character"]
+UNNAMED = "UNNAMED"
+
+
+def unicode_name(ch):
+    return unicodedata.name(ch, UNNAMED)
+
+
+# Where a character sits in JavaScript or TypeScript source. The lexer is a
+# heuristic: it decides whether "/" opens a regular expression from the token
+# before it, and it does not parse JSX. It reports where a character is. It
+# never lowers a severity, because hostile code can be written to look like a
+# sanitizer's character class.
+JS_CONTEXTS = ["code", "line-comment", "block-comment", "string", "template", "regex"]
+NOT_ANALYSED = "not-analysed"
+JS_SOURCE = re.compile(r"\.(?:[cm]?[jt]s|[jt]sx)$", re.I)
+JS_CONTEXT_MAX_CHARS = 400_000
+_REGEX_AFTER = set("(,=:[!&|?{};+-*%<>~^")
+_REGEX_AFTER_WORD = {"return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void", "throw", "yield", "await"}
+
+
+def js_contexts(text):
+    """Two byte arrays as long as text: an index into JS_CONTEXTS for each
+    character, and 1 where it is inside a regular expression character class."""
+    CODE, LINE, BLOCK, STRING, TEMPLATE, REGEX = range(6)
+    n = len(text)
+    ctx, cls = bytearray(n), bytearray(n)
+    st, quote, in_cls = CODE, "", False
+    depth = []      # one brace counter per open ${ ... } in a template
+    prev, word = "", ""
+    i = 0
+    while i < n:
+        ch = text[i]
+        nx = text[i + 1] if i + 1 < n else ""
+        if st == CODE:
+            if ch == "/" and nx in ("/", "*"):
+                st = LINE if nx == "/" else BLOCK
+                ctx[i] = ctx[i + 1] = st
+                i += 2
+                continue
+            if ch in "'\"":
+                st, quote = STRING, ch
+            elif ch == "`":
+                st = TEMPLATE
+            elif ch == "/" and (prev == "" or prev in _REGEX_AFTER or word in _REGEX_AFTER_WORD):
+                st, in_cls = REGEX, False
+            elif ch == "}" and depth and depth[-1] == 0:
+                depth.pop()
+                st = TEMPLATE
+            else:
+                if depth and ch in "{}":
+                    depth[-1] += 1 if ch == "{" else -1
+                if ch.isalnum() or ch in "_$":
+                    joined = i and (text[i - 1].isalnum() or text[i - 1] in "_$")
+                    word = word + ch if joined else ch
+                    prev = ch
+                elif not ch.isspace() and not HIDDEN.match(ch):
+                    prev, word = ch, ""
+            ctx[i] = st
+            i += 1
+            continue
+        ctx[i] = st
+        cls[i] = st == REGEX and in_cls
+        if ch == "\\" and nx and st in (STRING, TEMPLATE, REGEX):
+            ctx[i + 1], cls[i + 1] = st, cls[i]
+            i += 2
+            continue
+        if st == LINE:
+            if ch == "\n":
+                st = CODE
+        elif st == BLOCK:
+            if ch == "*" and nx == "/":
+                ctx[i + 1] = st
+                st = CODE
+                i += 1
+        elif st == STRING:
+            if ch == quote or ch == "\n":
+                st, prev, word = CODE, "a", ""
+        elif st == TEMPLATE:
+            if ch == "`":
+                st, prev, word = CODE, "a", ""
+            elif ch == "$" and nx == "{":
+                ctx[i + 1] = st
+                depth.append(0)
+                st, prev, word = CODE, "", ""
+                i += 1
+        elif st == REGEX:
+            if ch == "[":
+                in_cls = True
+            elif ch == "]":
+                in_cls = False
+                cls[i] = 1
+            elif (ch == "/" and not in_cls) or ch == "\n":
+                st, prev, word = CODE, "a", ""
+        i += 1
+    return ctx, cls
+
+
+_U_ESCAPE = re.compile(r"\\u[0-9A-Fa-f]{4}|\\u\{[0-9A-Fa-f]{1,6}\}")
+
+
+def hidden_detail(path, text, samples):
+    """Position facts for the sampled hidden characters of one file, built
+    only from numbers, booleans and fixed words. --agent prints them."""
+    analysed = bool(JS_SOURCE.search(path)) and len(text) <= JS_CONTEXT_MAX_CHARS
+    ctx, cls = js_contexts(text) if analysed else (None, None)
+    chars, lines = [], {}
+    for s in samples:
+        i, ch = s["offset"], text[s["offset"]]
+        in_class = bool(analysed and cls[i])
+        chars.append({"line": s["line"], "column": s["column"], "codePoint": s["codePoint"], "unicodeName": unicode_name(ch),
+                      "kind": s["kind"], "context": JS_CONTEXTS[ctx[i]] if analysed else NOT_ANALYSED,
+                      "inRegexClass": in_class,
+                      "inRegexRange": in_class and ("-" in (text[i - 1:i], text[i + 1:i + 2]))})
+        if s["line"] not in lines:
+            start = text.rfind("\n", 0, i) + 1
+            end = text.find("\n", i)
+            body = text[start:len(text) if end == -1 else end]
+            opens = sum(body.count(c) for c in "\u202A\u202B\u202D\u202E")
+            isolates = sum(body.count(c) for c in "\u2066\u2067\u2068")
+            closes, pops = body.count("\u202C"), body.count("\u2069")
+            lines[s["line"]] = {"line": s["line"], "sampled": 0, "unicodeEscapes": len(_U_ESCAPE.findall(body)),
+                                "bidiBalanced": (opens == closes and isolates == pops) if opens + isolates + closes + pops else None}
+        lines[s["line"]]["sampled"] += 1
+    return {"chars": chars, "lines": list(lines.values())}
+
+
 def reveal(s):
     return HIDDEN.sub(lambda m: "⟦%s⟧" % code_point(m.group(0)), s)
 
@@ -333,7 +470,7 @@ def scan_text(text, max_samples=10):
             full = text[start:len(text) if end == -1 else end]
             column = i - start + 1
             frm = max(0, column - 60)
-            samples.append({"line": line, "column": column, "codePoint": code_point(ch), "kind": kind,
+            samples.append({"line": line, "column": column, "offset": i, "codePoint": code_point(ch), "kind": kind,
                             "excerpt": truncate(reveal(full[frm:frm + 160]), 220)})
     return {"severity": severity, "counts": counts, "samples": samples} if severity else None
 
@@ -365,7 +502,8 @@ def run_unicode(ctx, max_files=4000, max_bytes=60_000_000):
         summary = ", ".join(f"{n} × {k}" for k, n in hit["counts"].items())
         findings.append({"severity": hit["severity"], "rule": "S3.hidden-in-file", "title": summary, "path": path,
                          "line": hit["samples"][0]["line"] if hit["samples"] else None,
-                         "samples": [{"line": s["line"], "text": f"{s['codePoint']} col {s['column']}: {s['excerpt']}"} for s in hit["samples"]]})
+                         "samples": [{"line": s["line"], "text": f"{s['codePoint']} col {s['column']}: {s['excerpt']}"} for s in hit["samples"]],
+                         "hidden": hidden_detail(path, res["text"], hit["samples"])})
     notes.append(f"Scanned {scanned} text files and {len(ctx.entries)} names.")
     if skipped:
         notes.append(f"{skipped} files could not be read as text (binary, too large, or not served).")
@@ -2139,12 +2277,34 @@ def term_safe(v):
     return TERMINAL_UNSAFE.sub(lambda m: "⟦%s⟧" % code_point(m.group(0)), str(v))
 
 
+def ascii_only(v):
+    """For S3 samples: every character outside printable ASCII is shown as
+    ⟦U+XXXX⟧, so the line cannot reorder, hide or restyle terminal output.
+    The two marker brackets that reveal() wrote are kept."""
+    return "".join(c if 0x20 <= ord(c) < 0x7F or c in "⟦⟧" else "⟦%s⟧" % code_point(c) for c in str(v))
+
+
 def json_safe(out):
     return TERMINAL_UNSAFE.sub(lambda m: json.dumps(m.group(0))[1:-1], out)
 
 
+def finding_url(report, f):
+    """The GitHub page for a finding's file at the scanned commit, with the
+    line when there is one. None for a local or AUR scan, where the files
+    read may not match any commit on GitHub."""
+    owner, _, repo = str(report.get("repository")).partition("/")
+    commit, path = report.get("commit"), f.get("path")
+    if (report.get("api") or {}).get("local") or not path or not isinstance(commit, str) or not SHA40.match(commit) \
+            or not _safe_owner_repo(owner, repo):
+        return None
+    line = f.get("line")
+    anchor = f"#L{line}" if isinstance(line, int) and not isinstance(line, bool) and line >= 1 else ""
+    return f"https://github.com/{owner}/{repo}/blob/{commit}/{urllib.parse.quote(str(path), safe='/')}{anchor}"
+
+
 def format_text(report):
-    out = [f"{report['repository']} at {report['commit'] or 'a local checkout'}"]
+    aur = str(report["repository"]).startswith("aur/")
+    out = [f"{report['repository']} at {report['commit'] or ('the Arch User Repository' if aur else 'a local checkout')}"]
     for c in report["checks"]:
         counts = {}
         for f in c["findings"]:
@@ -2159,10 +2319,16 @@ def format_text(report):
         for f in c["findings"]:
             loc = f" [{f['path']}{':' + str(f['line']) if f.get('line') else ''}]" if f.get("path") else ""
             out.append(f"  {f['severity'].upper():6} {f['title']}{loc}")
+            url = finding_url(report, f)
+            if url:
+                out.append(f"         {url}")
+            if str(f.get("rule", "")).startswith("S3."):
+                for smp in f.get("samples") or []:
+                    out.append(f"         line {smp.get('line')}: {ascii_only(smp.get('text', ''))}")
     api = report["api"]
     out.append("")
     if api.get("local"):
-        out.append("Local scan: no GitHub API calls.")
+        out.append("Read from aur.archlinux.org: no GitHub API calls." if aur else "Local scan: no GitHub API calls.")
     else:
         who = "signed in" if api.get("authenticated") else "anonymous"
         out.append(f"GitHub API ({who}): {api['calls']} requests used, {api['remaining']} of {api['limit']} left this hour.")
@@ -2347,10 +2513,11 @@ def list_packages(local_dir=None, sync_dir=None):
         if not PACKAGE_NAME.match(name) or fields.get("REASON") == "1":
             continue
         m = GITHUB_URL.match(fields.get("URL", ""))
-        if not m:
+        foreign = None if known is None else name not in known
+        if not m and not foreign:
             continue
-        rows.append({"name": name, "version": truncate(fields.get("VERSION", ""), 60), "source": f"{m.group(1)}/{m.group(2)}",
-                     "repo": None if known is None else known.get(name, ""), "foreign": None if known is None else name not in known})
+        rows.append({"name": name, "version": truncate(fields.get("VERSION", ""), 60), "source": f"{m.group(1)}/{m.group(2)}" if m else None,
+                     "repo": None if known is None else known.get(name, ""), "foreign": foreign})
     rows.sort(key=lambda r: (r["foreign"] is not True, r["name"]))
     return rows[:PACKAGES_MAX]
 
@@ -2395,6 +2562,47 @@ def compare_files(ctx, tree):
             "truncated": bool(tree.get("truncated")) or ctx.truncated}
 
 
+COMPARE_MAX_DIFFS = 8
+COMPARE_MAX_DIFF_LINES = 40
+COMPARE_MAX_DIFF_BYTES = 400_000
+
+
+def file_diffs(ctx, net, owner, repo, commit, paths):
+    """Line differences for changed text files: the source at the installed
+    commit against the installed file. Binary and oversized files are named
+    without lines."""
+    import difflib
+    out = []
+    for path in paths[:COMPARE_MAX_DIFFS]:
+        entry = {"path": truncate(path, 300), "lines": [], "more": 0, "note": ""}
+        local = ctx.read_blob(path, COMPARE_MAX_DIFF_BYTES)
+        res = net.raw(owner, repo, commit, path, COMPARE_MAX_DIFF_BYTES)
+        if local is None or b"\x00" in local[:8000] or "text" not in res:
+            entry["note"] = "binary, too large or unreadable, so no lines are shown"
+        else:
+            a = res["text"].splitlines()
+            b = local.decode("utf-8", "replace").splitlines()
+            lines = [l for l in difflib.unified_diff(a, b, lineterm="", n=1) if not l.startswith(("---", "+++"))]
+            if not lines:
+                entry["note"] = "differs only in line endings or the final newline"
+            entry["lines"] = [truncate(l, 200) for l in lines[:COMPARE_MAX_DIFF_LINES]]
+            entry["more"] = max(0, len(lines) - COMPARE_MAX_DIFF_LINES)
+        out.append(entry)
+    return out
+
+
+def commits_behind(net, owner, repo, installed, latest):
+    """How many commits the source has that the installed copy lacks, or None."""
+    if not installed or installed == latest:
+        return 0 if installed else None
+    try:
+        cmp = net.api(f"/repos/{owner}/{repo}/compare/{installed}...{latest}")
+    except ScanError:
+        return None
+    n = cmp.get("ahead_by") if isinstance(cmp, dict) else None
+    return n if isinstance(n, int) else None
+
+
 def _finding_keys(report):
     out = {}
     for c in report["checks"]:
@@ -2420,19 +2628,28 @@ def compare_plugin(pid, token=None):
         raise ScanError("This plugin has no GitHub origin recorded, so there is nothing to compare it with.")
     installed = scan_dir(info["root"], info["source"], info["commit"])
     source = scan(info["source"], token)
-    files = None
+    files, behind = None, None
+    owner, repo = info["source"].split("/")
     if info["commit"]:
         net = Net(token)
-        owner, repo = info["source"].split("/")
         tree = net.api(f"/repos/{owner}/{repo}/git/trees/{info['commit']}?recursive=1")
         if tree:
-            files = compare_files(LocalContext(info["root"], Net(None), info["source"], info["commit"]), tree)
+            ctx = LocalContext(info["root"], Net(None), info["source"], info["commit"])
+            files = compare_files(ctx, tree)
+            files["diffs"] = file_diffs(ctx, net, owner, repo, info["commit"], files["changed"])
+            behind = commits_behind(net, owner, repo, info["commit"], source["commit"])
+    if files is None:
+        verdict = "unknown"
+    elif files["changedCount"] or files["addedCount"] or files["missingCount"]:
+        verdict = "modified"
+    else:
+        verdict = "identical"
     return {
         "tool": "luddite-scout", "version": VERSION,
         "plugin": {k: v for k, v in info.items() if k != "root"},
         "repository": source["repository"], "commit": source["commit"], "api": source["api"],
-        "compare": {"installedCommit": info["commit"], "sourceCommit": source["commit"],
-                    "sameCommit": bool(info["commit"]) and info["commit"] == source["commit"],
+        "compare": {"verdict": verdict, "installedCommit": info["commit"], "sourceCommit": source["commit"],
+                    "sameCommit": bool(info["commit"]) and info["commit"] == source["commit"], "behind": behind,
                     "commitInSource": files is not None, "files": files, **diff_findings(installed, source)},
         "checks": source["checks"], "installedChecks": installed["checks"],
     }
@@ -2446,26 +2663,228 @@ def format_installed(listing):
         lines += ["", "Packages installed by name whose home page is a GitHub repository:"]
         for r in listing["packages"]:
             origin = "foreign (AUR or local build)" if r["foreign"] else (r["repo"] or "")
-            lines.append("  ".join([r["name"], r["version"], r["source"], origin]).rstrip())
+            lines.append("  ".join([r["name"], r["version"], r["source"] or "(no GitHub home page)", origin]).rstrip())
     return term_safe("\n".join(lines) or "No plugins are installed.").replace("⟦U+000A⟧", "\n")
 
 
 def format_compare(result):
     c = result["compare"]
-    lines = [f"{result['plugin']['id']}  from  {result['repository']}",
-             f"Installed commit: {c['installedCommit'] or 'unknown'}",
-             f"Source commit:    {c['sourceCommit']}" + ("  (same)" if c["sameCommit"] else "")]
     f = c["files"]
-    if f is None:
-        lines.append("Files: not compared. The installed commit is unknown or is not in the source repository.")
+    name = f"{result['plugin']['id']} from {result['repository']}"
+    if c["verdict"] == "modified":
+        lines = [f"DIFFERS: the installed copy of {name} does not match its source at the installed commit."]
+    elif c["verdict"] == "identical":
+        lines = [f"MATCHES: every installed file of {name} matches its source at the installed commit."]
     else:
-        lines.append(f"Files against the source at the installed commit: {f['checked']} checked, {f['changedCount']} changed, {f['addedCount']} added, {f['missingCount']} missing.")
-        for label, key in (("changed", "changed"), ("added", "added"), ("missing", "missing")):
-            lines += [f"  {label}: {p}" for p in f[key]]
-    for label, key in (("Findings only in the installed copy", "onlyInstalled"), ("Findings only in the source", "onlySource")):
-        lines.append(f"{label}: {c[key + 'Count']}")
-        lines += [f"  [{x['severity']}] {x['title']}" + (f"  {x['path']}" if x.get("path") else "") for x in c[key]]
+        lines = [f"NOT COMPARED: the installed commit of {name} is unknown or is not in the source repository."]
+    lines.append(f"Installed commit {c['installedCommit'] or 'unknown'}, latest source commit {c['sourceCommit']}.")
+    if c["sameCommit"]:
+        lines.append("The installed copy is at the latest commit.")
+    elif c["behind"] is not None:
+        lines.append(f"The source is {c['behind']} commit{'' if c['behind'] == 1 else 's'} newer.")
+    if f:
+        lines.append(f"{f['checked']} files checked: {f['changedCount']} changed, {f['addedCount']} added, {f['missingCount']} missing.")
+        for d in f.get("diffs", []):
+            lines.append(f"  changed: {d['path']}" + (f"  ({d['note']})" if d["note"] else ""))
+            lines += ["      " + l for l in d["lines"]]
+            if d["more"]:
+                lines.append(f"      {d['more']} more lines")
+        shown = {d["path"] for d in f.get("diffs", [])}
+        lines += [f"  changed: {p}" for p in f["changed"] if p not in shown]
+        lines += [f"  added: {p}" for p in f["added"]]
+        lines += [f"  missing: {p}" for p in f["missing"]]
+    labels = (("Findings only in the installed copy", "onlyInstalled"), ("Findings only in the latest source", "onlySource"))
+    for label, key in labels:
+        if c[key + "Count"]:
+            lines.append(f"{label}: {c[key + 'Count']}")
+            lines += [f"  [{x['severity']}] {x['title']}" + (f"  {x['path']}" if x.get("path") else "") for x in c[key]]
+    if not c["onlyInstalledCount"] and not c["onlySourceCount"]:
+        lines.append("Both scans report the same findings.")
     return "\n".join(term_safe(l) for l in lines)
+
+
+# ------------------------------------------------------------- AUR recipes
+
+# An AUR package is a PKGBUILD: a shell script that makepkg runs on the
+# user's machine, plus an optional install script that pacman runs as root.
+# The recipe is read as text and never run or sourced.
+AUR_MAX_BYTES = 400_000
+AUR_VCS = re.compile(r"^(?:[\w.+-]+::)?(?:git|svn|hg|bzr|fossil)(?:\+|://)", re.A)
+AUR_PINNED = re.compile(r"#(?:commit|tag|revision)=", re.A)
+AUR_SUMS = ("b2sums", "sha512sums", "sha384sums", "sha256sums", "sha224sums", "sha1sums", "md5sums", "cksums")
+AUR_WEAK = {"sha1sums", "md5sums", "cksums"}
+AUR_FETCH = re.compile(r"(?:^|[\s;&|(`$])(curl|wget|aria2c|git\s+clone|git\s+submodule\s+update|pip3?\s+install|npm\s+(?:install|ci|i)\b|pnpm\s+install|yarn\s+(?:install|add)|cargo\s+install|go\s+(?:get|install)|gem\s+install|bun\s+install)\b", re.A)
+AUR_PIPE_SHELL = re.compile(r"(?:curl|wget)[^\n|]{0,200}\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b|\b(?:ba|z)?sh\s+<\(\s*(?:curl|wget)", re.A)
+AUR_SUDO = re.compile(r"(?:^|[\s;&|(`$])(?:sudo|pkexec|doas|su\s+-c)\s", re.A)
+AUR_SETUID = re.compile(r"\bchmod\s+(?:-\w+\s+)*(?:[ugoa]*\+[rwx]*s|[2467][0-7]{3})\b|\bsetcap\b", re.A)
+AUR_ENCODED = re.compile(r"base64\s+(?:-d|--decode)|\beval\s+[\"'$`(]|\bxxd\s+-r\b", re.A)
+AUR_BINARY_SOURCE = re.compile(r"\.(?:deb|rpm|AppImage|appimage|exe|msi|dmg|pkg\.tar\.[a-z]+|snap|flatpak)(?:[?#\"']|$)|/releases/download/", re.A)
+AUR_INSTALL_HOOKS = ("pre_install", "post_install", "pre_upgrade", "post_upgrade", "pre_remove", "post_remove")
+AUR_SERVICE = re.compile(r"\bsystemctl\s+(?:--\S+\s+)*(?:enable|start|restart|daemon-reload|mask)\b|\buseradd\b|\bgroupadd\b|\busermod\b", re.A)
+
+
+def _pkgbuild_code(text):
+    """The recipe without comments and here-documents left as they are. Good
+    enough for pattern matches: a # inside a quoted string is rare in recipes."""
+    return "\n".join(re.sub(r"(^|\s)#.*$", r"\1", line) for line in text.split("\n"))
+
+
+def _pkgbuild_arrays(code):
+    """{name: [values]} for name=(...) assignments, with per-architecture
+    names such as source_x86_64 folded into their base name."""
+    out = {}
+    for m in re.finditer(r"^[ \t]*([a-z0-9]+sums|source|install|noextract|validpgpkeys)(?:_[a-z0-9_]+)?\+?=\(([^)]*)\)", code, re.M | re.A):
+        values = re.findall(r"\"([^\"]*)\"|'([^']*)'|([^\s\"']+)", m.group(2))
+        out.setdefault(m.group(1), []).extend(a or b or c for a, b, c in values)
+    return out
+
+
+def _pkgbuild_scalar(code, name):
+    m = re.search(r"^[ \t]*" + name + r"=[\"']?([^\"'\s#]*)", code, re.M | re.A)
+    return m.group(1) if m else ""
+
+
+def _line_hits(rx, text, cap=10):
+    out = []
+    for i, line in enumerate(text.split("\n")):
+        if rx.search(line):
+            out.append({"line": i + 1, "text": truncate(line.strip(), 200)})
+    return out[:cap], len(out)
+
+
+def analyze_pkgbuild(text):
+    code = _pkgbuild_code(text)
+    arrays = _pkgbuild_arrays(code)
+    findings = []
+    sources = arrays.get("source", [])
+    urls = [s.split("::", 1)[-1] for s in sources]
+    vcs = [s for s in sources if AUR_VCS.match(s)]
+    plain = [s for s in sources if not AUR_VCS.match(s)]
+    sums = {k: v for k, v in arrays.items() if k in AUR_SUMS}
+
+    if plain and not sums:
+        findings.append({"severity": "high", "rule": "S10.no-checksums", "title": "Sources have no checksums, so makepkg cannot tell a changed download from the intended one"})
+    elif sums:
+        best = [k for k in AUR_SUMS if k in sums][0]
+        skipped = sum(1 for v in sums[best] if v == "SKIP")
+        unexplained = max(0, skipped - len(vcs))
+        if unexplained:
+            findings.append({"severity": "medium", "rule": "S10.skip-checksum", "count": unexplained,
+                             "title": f"{unexplained} downloaded source{'s have' if unexplained > 1 else ' has'} its checksum set to SKIP"})
+        if set(sums) <= AUR_WEAK:
+            findings.append({"severity": "low", "rule": "S10.weak-checksum", "title": "Checksums use only MD5, SHA-1 or CRC, which do not resist a deliberate swap"})
+    unpinned = [s for s in vcs if not AUR_PINNED.search(s)]
+    if unpinned:
+        findings.append({"severity": "medium", "rule": "S10.unpinned-vcs", "count": len(unpinned),
+                         "title": f"{len(unpinned)} source{'s are' if len(unpinned) > 1 else ' is'} a repository checkout with no commit or tag, so each build takes whatever is newest",
+                         "samples": [{"text": truncate(s, 200)} for s in unpinned[:10]]})
+    insecure = [u for u in urls if re.match(r"^(?:http|ftp)://", u)]
+    if insecure:
+        findings.append({"severity": "medium", "rule": "S10.insecure-source", "count": len(insecure), "title": "Downloads a source over http or ftp",
+                         "samples": [{"text": truncate(u, 200)} for u in insecure[:10]]})
+    binary = [u for u in urls if AUR_BINARY_SOURCE.search(u)]
+    if binary or _pkgbuild_scalar(code, "pkgname").endswith("-bin"):
+        findings.append({"severity": "low", "rule": "S10.prebuilt-binary", "title": "Repackages a prebuilt binary, so scanning the upstream source does not cover what gets installed",
+                         "samples": [{"text": truncate(u, 200)} for u in binary[:10]]})
+
+    for rx, sev, rule, title in (
+        (AUR_PIPE_SHELL, "high", "S10.download-to-shell", "Pipes a download into a shell"),
+        (AUR_SUDO, "high", "S10.sudo", "Uses sudo, pkexec, doas or su during the build"),
+        (AUR_SETUID, "medium", "S10.setuid", "Sets setuid or setgid bits, or file capabilities"),
+        (AUR_ENCODED, "medium", "S10.encoded-or-eval", "Decodes base64 or evaluates a string, which can hide what runs"),
+        (AUR_FETCH, "medium", "S10.fetch-in-build", "Downloads or installs code from inside a build function, outside the checksummed sources"),
+    ):
+        hits, n = _line_hits(rx, code)
+        if hits:
+            findings.append({"severity": sev, "rule": rule, "title": title, "line": hits[0]["line"], "count": n, "samples": hits})
+
+    hosts = sorted({urllib.parse.urlsplit(re.sub(r"^(?:git|svn|hg|bzr|fossil)\+", "", u)).hostname or "" for u in urls if "://" in u} - {""})
+    if hosts:
+        findings.append({"severity": "info", "rule": "S10.source-hosts", "title": f"Downloads sources from {len(hosts)} host{'s' if len(hosts) > 1 else ''}",
+                         "samples": [{"text": truncate(h, 120)} for h in hosts[:20]]})
+    install = _pkgbuild_scalar(code, "install")
+    return findings, install
+
+
+def analyze_install_script(text):
+    code = _pkgbuild_code(text)
+    hooks = [h for h in AUR_INSTALL_HOOKS if re.search(r"^[ \t]*(?:function\s+)?" + h + r"\s*\(\s*\)", code, re.M | re.A)]
+    findings = [{"severity": "medium", "rule": "S10.install-script",
+                 "title": "Has an install script, which pacman runs as root" + (": " + ", ".join(hooks) if hooks else "")}]
+    for rx, sev, rule, title in (
+        (AUR_PIPE_SHELL, "high", "S10.download-to-shell", "Pipes a download into a shell"),
+        (AUR_FETCH, "high", "S10.install-script-fetch", "The install script downloads or installs code as root"),
+        (AUR_SETUID, "medium", "S10.setuid", "Sets setuid or setgid bits, or file capabilities"),
+        (AUR_ENCODED, "medium", "S10.encoded-or-eval", "Decodes base64 or evaluates a string, which can hide what runs"),
+        (AUR_SERVICE, "low", "S10.install-script-services", "The install script changes system services, users or groups"),
+    ):
+        hits, n = _line_hits(rx, code)
+        if hits:
+            findings.append({"severity": sev, "rule": rule, "title": title, "line": hits[0]["line"], "count": n, "samples": hits})
+    return findings
+
+
+def scan_aur(name):
+    if not PACKAGE_NAME.match(name):
+        raise ValueError("That is not a package name.")
+    net = Net(None)
+    quoted = urllib.parse.quote(name, safe="")
+
+    def plain(path):
+        status, _, body = net._request(f"https://aur.archlinux.org/cgit/aur.git/plain/{urllib.parse.quote(path, safe='')}?h={quoted}", AUR_MAX_BYTES)
+        if status == 404:
+            return None
+        if status != 200:
+            raise ScanError(f"The AUR returned {status}.")
+        return body.decode("utf-8", "replace")
+
+    status, info = net.get_json(f"https://aur.archlinux.org/rpc/v5/info?arg%5B%5D={quoted}", AUR_MAX_BYTES)
+    meta = (info or {}).get("results") or []
+    meta = meta[0] if meta and isinstance(meta[0], dict) else None
+    base = meta.get("PackageBase") if meta else name
+    if not isinstance(base, str) or not PACKAGE_NAME.match(base):
+        base = name
+    quoted = urllib.parse.quote(base, safe="")
+    recipe = plain("PKGBUILD")
+    if recipe is None:
+        raise NotFoundError("The AUR has no package by that name. A foreign package can also be a local build.")
+    findings, install = analyze_pkgbuild(recipe)
+    findings = [{**f, "path": "PKGBUILD"} for f in findings]
+    notes = ["Read the PKGBUILD as text. Nothing in it was run."]
+    if install:
+        if re.fullmatch(r"[A-Za-z0-9@._+-]{1,120}", install) or "$" in install:
+            path = install if "$" not in install else f"{base}.install"
+            script = plain(path)
+            if script is None:
+                findings.append({"severity": "medium", "rule": "S10.install-script", "title": "Names an install script that could not be read. Review it by hand.", "path": "PKGBUILD"})
+            else:
+                findings += [{**f, "path": path} for f in analyze_install_script(script)]
+        else:
+            findings.append({"severity": "medium", "rule": "S10.install-script", "title": "Names an install script with an unusual path. Review it by hand.", "path": "PKGBUILD"})
+    facts = []
+    if meta:
+        day = lambda t: time.strftime("%Y-%m-%d", time.gmtime(t)) if isinstance(t, (int, float)) else "unknown"
+        maintainer = meta.get("Maintainer")
+        facts = [["Version", truncate(meta.get("Version") or "", 60)],
+                 ["Maintainer", truncate(maintainer, 60) if isinstance(maintainer, str) else "none (orphaned)"],
+                 ["First submitted", day(meta.get("FirstSubmitted"))], ["Last modified", day(meta.get("LastModified"))],
+                 ["Votes", str(int(meta.get("NumVotes") or 0))]]
+        if not isinstance(maintainer, str):
+            findings.append({"severity": "medium", "rule": "S10.orphaned", "title": "The package has no maintainer, so anyone may adopt it and change the recipe"})
+        if meta.get("OutOfDate"):
+            findings.append({"severity": "low", "rule": "S10.out-of-date", "title": f"Flagged out of date since {day(meta.get('OutOfDate'))}"})
+        last = meta.get("LastModified")
+        if isinstance(last, (int, float)) and time.time() - last < 14 * 86400:
+            findings.append({"severity": "low", "rule": "S10.recently-changed", "title": f"The recipe changed on {day(last)}, within the last 14 days"})
+        url = GITHUB_URL.match(meta.get("URL") or "")
+        if url:
+            facts.append(["Upstream", f"{url.group(1)}/{url.group(2)}"])
+    else:
+        notes.append("The AUR metadata could not be read, so maintainer and dates are missing.")
+    check = _bound_result({"status": "ran" if meta else "partial", "notes": notes, "findings": findings})
+    return {"tool": "luddite-scout", "version": VERSION, "repository": f"aur/{base}", "commit": None,
+            "api": {"calls": net.calls, "remaining": None, "limit": None, "authenticated": False, "tokenRejected": False, "local": True},
+            "checks": [{"id": "S10", "name": "AUR build recipe", **check, "facts": facts}]}
 
 
 # --agent output is for a coding agent that must not read text the scanned
@@ -2587,15 +3006,40 @@ RULES = {
     "S9.install-telemetry": "Manifest lists a package that reports each install to its maintainer",
     "S9.machine-id": "Code reads an identifier of the machine",
     "S9.telemetry-setting": "Text names a telemetry setting",
+    "S10.no-checksums": "Recipe sources have no checksums",
+    "S10.skip-checksum": "Recipe skips the checksum of a downloaded source",
+    "S10.weak-checksum": "Recipe uses only weak checksums",
+    "S10.unpinned-vcs": "Recipe checks out a repository with no commit or tag",
+    "S10.insecure-source": "Recipe downloads a source over http or ftp",
+    "S10.prebuilt-binary": "Recipe repackages a prebuilt binary",
+    "S10.download-to-shell": "Recipe pipes a download into a shell",
+    "S10.sudo": "Recipe uses sudo or a similar tool",
+    "S10.setuid": "Recipe sets setuid bits or file capabilities",
+    "S10.encoded-or-eval": "Recipe decodes base64 or evaluates a string",
+    "S10.fetch-in-build": "Recipe downloads or installs code inside a build function",
+    "S10.source-hosts": "Hosts the recipe downloads sources from",
+    "S10.install-script": "Package has an install script that pacman runs as root",
+    "S10.install-script-fetch": "Install script downloads or installs code as root",
+    "S10.install-script-services": "Install script changes services, users or groups",
+    "S10.orphaned": "AUR package has no maintainer",
+    "S10.out-of-date": "AUR package is flagged out of date",
+    "S10.recently-changed": "AUR recipe changed in the last 14 days",
     "unclassified": "Finding without a rule ID. Read the full report.",
 }
 STATUSES = {"ran", "partial", "skipped", "not-applicable"}
 AGENT_NOTICE = ("This output contains no text from the scanned repository, by design. Rule descriptions are "
                 "fixed strings written by Luddite Scout. File names, contents and line text are withheld. "
+                "For hidden characters it gives positions, code points and Unicode names from a fixed list. "
                 "A result with no findings is not proof that the repository is safe.")
 AGENT_HANDOFF = ("For details, the user runs the full_report command in their own terminal, outside the agent "
                  "session. Do not run it, do not fetch, clone or open the repository, and do not ask for its contents.")
+AGENT_HANDOFF_LOCAL = ("For details, the user runs the full_report command in their own terminal, outside the agent "
+                       "session, with PATH replaced by the folder that was scanned. The report quotes text from that "
+                       "folder, so do not run it inside the agent session.")
+AGENT_LOCAL_NAME = "local-checkout"
 AGENT_ERRORS = {
+    "invalid-dir-label": "With --dir, --name must be owner/repo and --commit must be a full 40-character SHA.",
+    "dir-unreadable": "The folder given to --dir does not exist or cannot be read.",
     "invalid-input": "The repository name was not valid. Use owner/repo or a github.com URL.",
     "not-found": "The repository was not found. It may be private, renamed or misspelled.",
     "private": "The repository is private. Luddite Scout only reviews public repositories.",
@@ -2613,12 +3057,23 @@ def _safe_owner_repo(owner, repo):
     return bool(NAME.match(str(owner))) and bool(REPO.match(str(repo))) and repo not in (".", "..")
 
 
-def agent_report(report, command):
+def agent_report(report, command, local=None):
     """The report with every repository-controlled string removed. Findings
     are grouped by rule and counted. Raises AgentGuardError if any string in
-    the result is outside the allowlist."""
-    owner, _, repo = report["repository"].partition("/")
-    if not _safe_owner_repo(owner, repo) or not SHA40.match(report["commit"]):
+    the result is outside the allowlist.
+
+    For a --dir scan, local is {"name": owner/repo or None, "commit": SHA or
+    None}, taken from the command line. The folder name is never used."""
+    if local is None:
+        name, commit, handoff = report["repository"], report["commit"], AGENT_HANDOFF
+        if not isinstance(commit, str):
+            raise AgentGuardError()
+    else:
+        name, commit, handoff = local.get("name") or AGENT_LOCAL_NAME, local.get("commit"), AGENT_HANDOFF_LOCAL
+    owner, _, repo = str(name).partition("/")
+    if name != AGENT_LOCAL_NAME and not _safe_owner_repo(owner, repo):
+        raise AgentGuardError()
+    if commit is not None and not SHA40.match(commit):
         raise AgentGuardError()
     highest = None
     complete = True
@@ -2638,25 +3093,87 @@ def agent_report(report, command):
         rules = sorted(groups.values(), key=lambda g: (SEVERITIES.index(g["severity"]), g["rule"]))
         counts = {s: sum(g["count"] for g in rules if g["severity"] == s) for s in SEVERITIES}
         entry = {"id": c["id"], "name": c["name"], "status": status, "counts": counts, "rules": rules}
+        if c["id"] == "S3":
+            entry.update(_agent_hidden(c["findings"]))
         sc = c.get("scorecard") or {}
         if sc.get("state") == "ok" and isinstance(sc.get("score"), (int, float)) and not isinstance(sc.get("score"), bool):
             entry["scorecard"] = sc["score"]
         checks.append(entry)
     out = {"tool": "luddite-scout", "version": VERSION, "mode": "agent",
-           "repository": f"{owner}/{repo}", "commit": report["commit"],
+           "repository": name, "commit": commit,
            "highest_severity": highest, "complete": complete, "checks": checks,
-           "full_report": command, "notice": AGENT_NOTICE, "handoff": AGENT_HANDOFF}
+           "full_report": command, "notice": AGENT_NOTICE, "handoff": handoff}
     _guard(out, command)
     return out
 
 
+AGENT_HIDDEN_MAX_CHARS = 40
+AGENT_HIDDEN_MAX_LINES = 20
+AGENT_MAX_INT = 100_000_000
+
+
+def _agent_hidden(findings):
+    """S3 detail for --agent: where each sampled hidden character sits. A file
+    is named by its position among the S3.hidden-in-file findings, counted
+    from 1 in report order, never by its path. Every value is rebuilt here
+    from a number, a boolean or a fixed word, so a finding that carries
+    anything else is dropped."""
+    chars, lines, more = [], [], False
+    number = 0
+    for f in findings:
+        if f.get("rule") != "S3.hidden-in-file":
+            continue
+        number += 1
+        h = f.get("hidden") if isinstance(f.get("hidden"), dict) else {}
+        try:
+            for c in h.get("chars") or []:
+                ch = chr(int(str(c["codePoint"])[2:], 16))
+                if not HIDDEN.fullmatch(ch):
+                    raise ValueError()
+                item = {"file": number, "line": _agent_int(c["line"]), "column": _agent_int(c["column"]),
+                        "code_point": code_point(ch), "unicode_name": unicode_name(ch), "kind": classify_char(ch)[0],
+                        "context": c["context"] if c["context"] in JS_CONTEXTS else NOT_ANALYSED,
+                        "in_regex_class": c["inRegexClass"] is True, "in_regex_range": c["inRegexRange"] is True}
+                if len(chars) < AGENT_HIDDEN_MAX_CHARS:
+                    chars.append(item)
+                else:
+                    more = True
+            for l in h.get("lines") or []:
+                item = {"file": number, "line": _agent_int(l["line"]), "sampled": _agent_int(l["sampled"]),
+                        "unicode_escapes": _agent_int(l["unicodeEscapes"]),
+                        "bidi_balanced": l["bidiBalanced"] if isinstance(l["bidiBalanced"], bool) else None}
+                if len(lines) < AGENT_HIDDEN_MAX_LINES:
+                    lines.append(item)
+                else:
+                    more = True
+        except (KeyError, TypeError, ValueError, IndexError):
+            more = True
+    if not number:
+        return {}
+    return {"hidden_characters": chars, "hidden_lines": lines, "hidden_detail_truncated": more}
+
+
+def _agent_int(v):
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= AGENT_MAX_INT:
+        raise ValueError()
+    return v
+
+
+_HIDDEN_CHARS = [chr(cp) for lo, hi in HIDDEN_RANGES for cp in range(lo, hi + 1)]
+AGENT_HIDDEN_WORDS = (set(JS_CONTEXTS) | {NOT_ANALYSED, UNNAMED} | set(HIDDEN_KINDS)
+                      | {code_point(c) for c in _HIDDEN_CHARS} | {unicode_name(c) for c in _HIDDEN_CHARS})
+
+
 def _guard(value, command):
-    allowed = (set(RULES) | set(RULES.values()) | STATUSES | set(SEVERITIES) | {name for _, name, _ in CHECKS}
-               | {cid for cid, _, _ in CHECKS} | {"luddite-scout", "agent", VERSION, AGENT_NOTICE, AGENT_HANDOFF, command}
+    allowed = (AGENT_HIDDEN_WORDS | set(RULES) | set(RULES.values()) | STATUSES | set(SEVERITIES) | {name for _, name, _ in CHECKS}
+               | {cid for cid, _, _ in CHECKS} | {"luddite-scout", "agent", VERSION, AGENT_NOTICE, AGENT_HANDOFF, AGENT_HANDOFF_LOCAL, command}
                | set(AGENT_ERRORS) | set(AGENT_ERRORS.values()))
     keys = {"tool", "version", "mode", "repository", "commit", "highest_severity", "complete", "checks", "full_report",
             "notice", "handoff", "id", "name", "status", "counts", "rules", "rule", "severity", "count", "description",
-            "scorecard", "error", "message", *SEVERITIES}
+            "scorecard", "error", "message", *SEVERITIES,
+            "hidden_characters", "hidden_lines", "hidden_detail_truncated", "file", "line", "column", "code_point",
+            "unicode_name", "kind", "context", "in_regex_class", "in_regex_range", "sampled", "unicode_escapes",
+            "bidi_balanced"}
 
     def walk(v, key):
         if isinstance(v, dict):
@@ -2670,7 +3187,7 @@ def _guard(value, command):
         elif isinstance(v, str):
             if key == "repository":
                 o, _, r = v.partition("/")
-                ok = _safe_owner_repo(o, r)
+                ok = v == AGENT_LOCAL_NAME or _safe_owner_repo(o, r)
             elif key == "commit":
                 ok = bool(SHA40.match(v))
             else:
@@ -2688,13 +3205,17 @@ def agent_error(code):
     return out
 
 
-def full_report_command(target):
+def full_report_command(target, local=False):
     """The command the user runs in their own terminal for the full report.
-    Built from this script's own path and the validated owner/repo."""
-    ids = parse_repo_input(target)
+    Built from this script's own path and the validated owner/repo. For a
+    --dir scan it ends in the fixed word PATH, never the folder that was
+    given, because a folder name can hold text aimed at an agent."""
     script = os.path.realpath(sys.argv[0] if sys.argv and sys.argv[0] else __file__)
     if not re.fullmatch(r"[A-Za-z0-9._/+-]{1,400}", script):
         script = "scout"
+    if local:
+        return f"python3 -I -S {script} --dir PATH"
+    ids = parse_repo_input(target)
     return f"python3 -I -S {script} {ids['owner']}/{ids['repo']}"
 
 
@@ -2744,14 +3265,17 @@ def gh_token():
     return token if TOKEN.fullmatch(token) else None
 
 
-VALUED = ("--name", "--commit", "--plugin")
+VALUED = ("--name", "--commit", "--plugin", "--aur")
 
 
 def installed_main(flags, values):
     """--installed, --plugin ID and --plugin ID --compare."""
     as_json = "--json" in flags
     try:
-        if "--installed" in flags:
+        if "--aur" in values:
+            out = scan_aur(values["--aur"])
+            text = format_text
+        elif "--installed" in flags:
             out = list_installed()
             text = format_installed
         elif "--compare" in flags:
@@ -2786,6 +3310,11 @@ def main(argv):
             del argv[i:i + 2]
     args = [a for a in argv if not a.startswith("--")]
     flags = {a for a in argv if a.startswith("--")}
+    if "--aur" in values:
+        if args or flags - {"--json"} or set(values) - {"--aur"}:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        return installed_main(flags, values)
     if "--installed" in flags or "--plugin" in values:
         allowed = {"--json", "--installed"} if "--installed" in flags else {"--json", "--compare", "--gh-token"}
         if args or flags - allowed or ("--installed" in flags and values) or set(values) - {"--plugin"} \
@@ -2796,7 +3325,7 @@ def main(argv):
     unknown = flags - {"--json", "--agent", "--token-stdin", "--gh-token", "--help", "--version", "--dir"}
     if "--dir" not in flags and values:
         unknown = unknown | set(values)
-    if "--dir" in flags and flags & {"--agent", "--token-stdin", "--gh-token"}:
+    if "--dir" in flags and flags & {"--token-stdin", "--gh-token"}:
         unknown = unknown | {"--dir"}
     if "--help" in flags or unknown or len(args) != 1:
         if "--version" in flags and not args:
@@ -2813,6 +3342,8 @@ def main(argv):
     elif "--gh-token" in flags:
         token = gh_token()
     if "--agent" in flags:
+        if "--dir" in flags:
+            return agent_dir_main(args[0], values.get("--name"), values.get("--commit"))
         return agent_main(args[0], token)
     try:
         if "--dir" in flags:
@@ -2855,6 +3386,33 @@ def agent_main(target, token):
         out, code = agent_error("guard"), 1
     except Exception:  # any other failure text may quote the repository
         out, code = agent_error("scan-failed"), 1
+    print(json.dumps(out, ensure_ascii=True, indent=1))
+    return code
+
+
+def agent_dir_main(path, name, commit):
+    """--agent --dir: the agent summary for a local checkout. The label comes
+    only from --name and --commit, and only when both pass validation."""
+    try:
+        if name is not None:
+            ids = parse_repo_input(name)
+            name = f"{ids['owner']}/{ids['repo']}"
+        if commit is not None and not SHA40.match(commit):
+            raise ValueError()
+    except ValueError:
+        out, code = agent_error("invalid-dir-label"), 2
+    else:
+        try:
+            report = scan_dir(path, name, commit)
+            out = agent_report(report, full_report_command(None, local=True), {"name": name, "commit": commit})
+            code = 0
+        except ScanError as e:
+            unreadable = not os.path.isdir(path)
+            out, code = agent_error("dir-unreadable" if unreadable else "scan-failed"), 1
+        except AgentGuardError:
+            out, code = agent_error("guard"), 1
+        except Exception:  # any other failure text may quote the folder
+            out, code = agent_error("scan-failed"), 1
     print(json.dumps(out, ensure_ascii=True, indent=1))
     return code
 
